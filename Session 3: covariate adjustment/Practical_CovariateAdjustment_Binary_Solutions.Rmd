@@ -1,0 +1,332 @@
+---
+title: 'Covariate Adjustment: practical binary endpoints'
+author: "Kelly Van Lancker (kelly.vanlancker@ugent.be)"
+date: "`r format(Sys.time(), '%Y-%m-%d %I:%M')`"
+output:
+  pdf_document:
+    toc: yes
+  word_document:
+    toc: yes
+  html_document:
+    toc: yes
+    theme: united
+    highlight: tango
+subtitle: Worked Examples using Resampled Data from MISTIE III Trial
+---
+
+
+```{r Report_Setup, echo = FALSE, message = FALSE}
+## Create Paths
+mistie3_results_paper_link <-
+  "https://www.thelancet.com/article/S0140-6736(19)30195-3/fulltext"
+### Graphics and Report Options ################################################
+table_digits <-
+  1 # Significant Figures for Mean/SD, N (%), Median/IQR
+### Set Default Options ########################################################
+options(knitr.kable.NA = "")
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  results = "markup"
+) 
+```
+# Prerequisites
+## Using This Tutorial
+
+This tutorial contains an example dataset as well as code to illustrate how to perform covariate adjustment in practice using [R](https://www.r-project.org/). 
+
+## Installing and Loading R Packages
+
+The following packages and their dependencies need to be installed:
+
+  - [table1](https://cran.r-project.org/web/packages/table1/index.html) - Creating simple tabulations in aggregate and by treatment arm
+  - [tidyverse](https://cran.r-project.org/web/packages/tidyverse/index.html) - An ecosystem of packages for working with data
+
+  
+```{r install-packages, eval = FALSE, message = FALSE}
+required_packages <-
+  c("table1", "tidyverse")
+
+install.packages(required_packages)
+```  
+
+Once the required packages are installed, they can be loaded using `library()`
+
+```{r load-packages, warning = FALSE}
+library(table1)
+library(tidyverse)
+```
+
+--------------------------------------------------------------------------------
+
+# Background: MISTIE III Study Design
+
+Data used in this example are simulated using data based on the **M**inimally **I**nvasive **S**urgery with **T**hrombolysis in **I**ntracerebral haemorrhage **E**vacuation trial ([MISTIE III](https://doi.org/10.1016/s0140-6736(19)30195-3): [NCT01827046](https://clinicaltrials.gov/show/NCT01827046)). MISTIE III was an open-label, blinded endpoint, Phase III clinical trial of minimally invasive surgery with thrombolysis in intracerebral haemorrhage evacuation. The goal was to assess whether minimally invasive catheter evacuation followed by thrombolysis, with the aim of decreasing clot size to 15 mL or less, would improve functional outcome in patients with intracerebral haemorrhage (a severe form of stroke). To this end, participants were randomized 1:1 to standard-of-care medical management, or minimal invasive surgery with Alteplase for ICH removal. Outcomes were measured at 30, 180, and 365-days post-randomization using the Modified Rankin Scale (mRS). The primary outcome was defined as having a mRS score of 0-3 measured 365 days from enrollment  (defined as a *success*). Survival was also assessed, with patients administratively censored on the date of their final MRS assessment.
+Though the trial used covariate adaptive randomization, we ignore that in our discussion below, for simplicity (since analogous computations taking this into account give similar results), and we will assume simple randomization.
+
+
+## Creating Simulated Data:
+The data in this template are simulated data, generated from probability models fit to the original study data, and *not the actual data from the MISTIE III trial.* A new synthetic dataset was created by resampling baseline covariates from the original data with replacement. The outcome columns in the synthetic dataset were sequentially replaced using simulated values based on predictions from a sequence of regression models based on the actual study data.
+
+### Load MISTIE III Data
+The data can be loaded directly from Github:
+
+```{r sim_miii-data, echo = TRUE}
+data_url <-
+  "https://github.com/jbetz-jhu/CovariateAdjustmentTutorial/raw/main/Simulated_MISTIE_III_v1.2.csv"
+
+sim_miii <-
+  read.csv(file = url(data_url))
+
+# Read in data: Recast categorical variables as factors
+sim_miii <-
+  sim_miii %>%
+  dplyr::tibble() %>%
+  dplyr::mutate(
+    male =
+      factor(
+        x = male,
+        levels = 0:1,
+        labels = c("0. Female", "1. Male")
+      ),
+    across(
+      .cols = all_of(
+        x = c(
+          "hx_cvd",
+          "hx_hyperlipidemia",
+          "on_anticoagulants",
+          "on_antiplatelets"
+        )
+      ),
+      .fns = function(x)
+        factor(x, levels = 0:1, labels = c("0. No", "1. Yes"))
+    ),
+    across(.cols = starts_with("gcs") | starts_with("mrs"),
+           .fns = factor),
+    ich_location =
+      factor(x = ich_location,
+             levels = c("Deep", "Lobar")),
+    arm =
+      factor(x = arm,
+             levels = c("medical", "surgical")),
+    tx = 1 * (arm == "surgical")
+  ) %>%
+  dplyr::rename(id = sim_participant_id)
+```
+
+The complete simulated trial data without any missing values are in a `data.frame` named `sim_miii`.
+  
+  - Participant Identifier
+    - `id`: Participant Identifier
+  - Baseline Covariates
+    - `age`: Age at baseline in years
+    - `male`: Participant sex (1 for Male or 0 for female)
+    - `hx_cvd`: Cardiovascular disease history
+    - `hx_hyperlipidemia`: Hyperlipidaemia medication compliant history
+    - `on_anticoagulants`: On anticoagulants medication
+    - `on_antiplatelets`: On antiplatelet medication
+    - `ich_location`: Intracerebral haemorrhage clot location: (`Lobar`, `Deep`)
+    - `ich_s_volume`:	Intracerebral hemorrhage volume on stability scan
+    - `ivh_s_volume`:	Intraventricular hemorrhage volume on stability scan
+    - `gcs_category`: Severity of impairment as measured by Glasgow Coma Score (GCS)
+  - Treatment:
+    - `arm`: Treatment arm (surgical versus standard medical care)
+    - `tx`: Treatment arm (binary; 1 for surgical and 0 for standard medical care) 
+    - `ich_eot_volume`: Intracerebral hemorrhage volume on end-of-treatment scan
+  - Outcomes:
+    - `mrs_30d`: mRS at 30 days (`0-3`, `4`, `5`, `6`)
+    - `mrs_30d_complete`: mRS at 30 days if no data were missing
+    - `mrs_180d`: mRS at 180 days (`0-2`, `3`, `4`, `5`, `6`)
+    - `mrs_180d_complete`: mRS at 180 days if no data were missing
+    - `mrs_365d`: mRS at 365 days (`0-1`, `2`, `3`, `4`, `5`, `6`)
+    - `mrs_365d_complete`: mRS at 365 days if no data were missing
+    - `days_on_study`: days until death or administrative censoring
+    - `died_on_study`: participant died (`1`) or is censored (`0`)
+    
+The outcomes `mrs_30d`, `mrs_180d`, and `mrs_365d` contain missing values: the actual values before the missingness mechanism is applied are also included with the `_complete` suffix.
+
+### Define Dichotomized Outcomes
+The primary outcome was defined as having a modified Rankin Scale (mRS) score of 0-3 measured 365 days from enrollment (defined as a *success*). We therefore dichotomized `mrs_30d_complete`, `mrs_180d_complete` and `mrs_365d_complete`.
+
+```{r dichotomized-outcome-data}
+sim_miii$mrs_bin_30d_complete = ifelse(sim_miii$mrs_30d_complete == "0-3", 1, 0)
+sim_miii$mrs_bin_180d_complete = ifelse(
+  sim_miii$mrs_180d_complete == "0-2" ,
+  1,
+  ifelse(sim_miii$mrs_180d_complete ==
+           "3", 1,
+         0)
+)
+sim_miii$mrs_bin_365d_complete = ifelse(
+  sim_miii$mrs_365d_complete == "0-1" ,
+  1,
+  ifelse(
+    sim_miii$mrs_365d_complete == "2",
+    1,
+    ifelse(sim_miii$mrs_365d_complete ==
+             "3", 1,
+           0)
+  )
+)
+```
+  
+  - Dichotomized Outcomes:
+    - `mrs_bin_30d_complete`: Dichotomized mRS score at 30 days (1 if mRS equals 0–3, 0 otherwise)
+    - `mrs_bin_180d_complete`: Dichotomized mRS score at 180 days (1 if mRS equals 0–3, 0 otherwise)
+    - `mrs_bin_365d_complete`: Dichotomized mRS score at 365 days (1 if mRS equals 0–3, 0 otherwise)
+
+
+### Reference Level for Treatment
+
+When the treatment is a `factor` variable, we can use the `levels()` function to see the reference level (i.e., the comparator/control group): it will appear as the first level.
+
+```{r check-reference-level}
+# Check reference level
+levels(sim_miii$arm)
+```
+
+Make sure that the reference level is appropriately chosen before running analyses. In this case study, `medical' is the reference level.
+
+## Exploring the data
+### Baseline Demographics & Stratum
+
+Below are summary statistics of participant characteristics at baseline:
+
+```{r table-demographic-characteristics-stratum}
+table1(
+  ~ age + male + hx_cvd + hx_hyperlipidemia + on_anticoagulants + on_antiplatelets +
+    ich_location + ich_s_volume + ivh_s_volume + gcs_category + ich_eot_volume |
+    arm,
+  data = sim_miii
+)
+```
+
+
+
+### Modified Rankin Scale Outcomes
+Here we summarize the outcomes of the study (without missing data):
+
+```{r table-mRS-outcomes}
+table1(
+  ~ mrs_30d_complete + mrs_180d_complete + mrs_365d_complete + mrs_bin_30d_complete +
+    mrs_bin_180d_complete + mrs_bin_365d_complete | arm,
+  data = sim_miii %>% dplyr::mutate(
+    mrs_bin_30d_complete =
+      factor(x = mrs_bin_30d_complete,
+             levels = c("0", "1")),
+    mrs_bin_180d_complete =
+      factor(x = mrs_bin_180d_complete,
+             levels = c("0", "1")),
+    mrs_bin_365d_complete =
+      factor(x = mrs_bin_365d_complete,
+             levels = c("0", "1"))
+  )
+)
+```
+
+--------------------------------------------------------------------------------
+
+# Covariate Adjustment 
+## Design Parameters
+The estimand in the trial was defined as the (absolute) risk difference, that is, the difference between the population proportion of successes under assignment to treatment versus control (where control was standard of care using medical management).
+The total sample size of approximately 498 patients was calculated based on the assumption that 25\% of the patients would have an mRS score of 0–3 in the standard medical care group versus 38\% of patients in the MISTIE group and provides a power of 88\% to detect such a population risk difference of 13\% at a 5\% significance level.
+
+## Unadjusted Analysis
+### Question 1.
+Calculate an unadjusted estimator for the (absolute) risk difference of interest, along with a confidence interval and $p$-value. Make use of the function `prop.test`.
+
+```{r}
+mistieiii_prop_test <-
+  prop.test(
+    x = with(sim_miii, table(mrs_bin_365d_complete, arm))
+  )
+
+print(mistieiii_prop_test)
+
+# Estimate
+-diff(mistieiii_prop_test$estimate) 
+
+# Confidence Interval
+mistieiii_prop_test$conf.int 
+
+# P-Value
+mistieiii_prop_test$p.value 
+```
+
+## Covariate-Adjusted Analysis
+We can use a logistic regression to adjust for baseline covariates with a binary outcome. However, the coefficient in a logistic regression is a *conditional association:* it is the associated change in the log odds of the outcome with a unit change in the predictor when holding all other variables constant. The average treatment effect is a *marginal, not conditional quantity*. In order to obtain the average treatment effect, we must marginalize by averaging over the covariates. 
+
+### Question 2.
+First, regress the final outcome `mrs_bin_365d_complete` on the treatment assignment indicator `arm` and the baseline covariates `ich_s_volume`, `age`, `ivh_s_volume`, `ich_location` and `gcs_category` using the function `glm` with `family = binomial(link = "logit")`.
+
+```{r}
+# Fit the `glm` object
+mistieiii_glm <-
+  glm(
+    formula = 
+      mrs_bin_365d_complete ~
+      arm + ich_s_volume + age + ivh_s_volume +
+      ich_location + gcs_category,
+    data = sim_miii,
+    family = binomial(link = "logit")
+  )
+
+# Print a summary of the `glm` object
+summary(mistieiii_glm) 
+```
+
+### Question 3.
+We obtain an estimate of the average treatment effect by plugging in estimates of the probabilities from a fitted model: this involves obtaining a prediction for each individual as if they were assigned to treatment (using the function `predict`), and a prediction for each individual assigned to control, and marginalizing over the covariates by taking the sample average. 
+
+Calculate the adjusted estimator for the (absolute) risk difference of interest, along with the variance and a confidence interval. The variance can be calculted as $1/n$ times the sample variance of
+\[\frac{Z}{\hat{P}(Z=1)}[Y-\hat{E}(Y|Z=1, X)]+\hat{E}(Y|Z=1, X)-\left\{\frac{1-Z}{1-\hat{P}(Z=1)}[Y-\hat{E}(Y|Z=0, X)]+\hat{E}(Y|Z=1, X)\right\}\]
+
+```{r}
+# Predict Pr{Y = 1 | Z = 1, X}
+pr_y1_z1 <-
+  predict(
+    object = mistieiii_glm,
+    newdata =
+      sim_miii %>% 
+      dplyr::mutate(
+        arm = "surgical"
+      ),
+    type = "response"
+  )
+
+# Predict Pr{Y = 1 | Z = 0, X}
+pr_y1_z0 <-
+  predict(
+    object = mistieiii_glm,
+    newdata =
+      sim_miii %>% 
+      dplyr::mutate(
+        arm = "medical"
+      ),
+    type = "response"
+  )
+
+# Estimate
+adj_mean = mean(pr_y1_z1) - mean(pr_y1_z0) 
+print(adj_mean)
+
+# Standard Error
+p_arm = mean(sim_miii$arm=="surgical")
+adj_se = sqrt( 
+  var( 
+    (sim_miii$arm=="surgical")/p_arm*
+      (sim_miii$mrs_bin_365d_complete-pr_y1_z1) + pr_y1_z1 -
+      ((sim_miii$arm=="medical")/(1-p_arm)*
+         (sim_miii$mrs_bin_365d_complete-pr_y1_z0) + pr_y1_z0) )/
+    nrow(sim_miii)
+)
+print(adj_se)
+
+# Confidence Interval
+c(adj_mean-qnorm(0.975)*adj_se, adj_mean+qnorm(0.975)*adj_se)
+```
+
+### Question 4.
+Compare the confidence intervals of the unadjusted and covariate-adjusted estimators. What do you observe?
+
